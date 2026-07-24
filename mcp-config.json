@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "zwcad-mcp": {
+      "command": "C:\\path\\to\\ZWCAD-MCP\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "zwcad_mcp"],
+      "env": {
+        "ZWCAD_MCP_BACKEND": "auto",
+        "ZWCAD_MCP_IPC_DIR": "C:/zwcad-temp",
+        "ZWCAD_MCP_IPC_TIMEOUT": "10.0"
+      }
+    }
+  }
+}
