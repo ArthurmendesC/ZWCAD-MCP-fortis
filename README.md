@@ -1,6 +1,6 @@
 # ZWCAD-MCP
 
-面向 **中望CAD（ZWCAD）** 的 MCP（Model Context Protocol）服务器，让 Claude / Cursor 等 AI 客户端通过自然语言直接驱动中望CAD 绘图、修改、查询与出图。
+面向 **中望CAD（ZWCAD）** 的 MCP（Model Context Protocol）服务器，让 AI 客户端通过自然语言直接驱动中望CAD 绘图、修改、查询与出图。
 
 本项目基于 [puran-water/autocad-mcp](https://github.com/puran-water/autocad-mcp) 改写，并参考了 [mysteryboy2000/ZWCAD-Mechanical-MCP](https://github.com/mysteryboy2000/ZWCAD-Mechanical-MCP) 与 [中望CAD 二次开发文档](https://www.zwsoft.cn/support/zwcad-devdoc)。
 
@@ -210,8 +210,7 @@ ZWCAD-MCP/
 
 - [puran-water/autocad-mcp](https://github.com/puran-water/autocad-mcp)（MIT）— 本项目的架构基线
 - [mysteryboy2000/ZWCAD-Mechanical-MCP](https://github.com/mysteryboy2000/ZWCAD-Mechanical-MCP) — 中望CAD MCP 工具设计参考
-- [中望软件二次开发文档](https://www.zwsoft.cn/support/zwcad-devdoc) — ZWCAD LISP/API 参考
 
 ## License
 
-MIT
+dalingo
