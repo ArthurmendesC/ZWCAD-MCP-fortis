@@ -1,216 +1,167 @@
-# ZWCAD-MCP
+# ZWCAD-MCP-fortis
 
-面向 **中望CAD（ZWCAD）** 的 MCP（Model Context Protocol）服务器，让 AI 客户端通过自然语言直接驱动中望CAD 绘图、修改、查询与出图。
+**English** · [Português](README.pt-BR.md) · [中文 (original)](README.zh-CN.md)
 
-本项目基于 [puran-water/autocad-mcp](https://github.com/puran-water/autocad-mcp) 改写，并参考了 [mysteryboy2000/ZWCAD-Mechanical-MCP](https://github.com/mysteryboy2000/ZWCAD-Mechanical-MCP) 与 [中望CAD 二次开发文档](https://www.zwsoft.cn/support/zwcad-devdoc)。
+MCP server that lets an AI client (Claude Desktop, Cursor, etc.) read and draw in **ZWCAD** with nothing popping up on screen, while you keep working in another program.
 
-## 特性
+This is a fork of [dalingo81/ZWCAD-MCP](https://github.com/dalingo81/ZWCAD-MCP) (commit `49883a9`), itself based on [puran-water/autocad-mcp](https://github.com/puran-water/autocad-mcp). The original was built for Chinese Windows. This fork makes it work on Windows in any other language (Portuguese, English, Spanish…) and removes all on-screen interference. Every change is tagged `[Fortis]` in the code and described in [FORTIS_PATCHES.md](FORTIS_PATCHES.md) (Portuguese).
 
-双后端、同一套 API：
+Tested on ZWCAD 2026, Portuguese Windows.
 
-| 后端 | 运行环境 | 是否需要中望CAD | 截图方式 |
-|------|----------|-----------------|----------|
-| **File IPC**（AutoLISP + Win32 PostMessage） | Windows | 需要（ZWCAD 2020+ 专业版/标准版） | Win32 `PrintWindow` 窗口 PNG 截图 |
-| **ezdxf**（无头模式） | 任意平台（Windows / Linux / macOS / WSL） | 不需要 | matplotlib 渲染 PNG |
+## What changes from the original
 
-- **免抢焦点通信**：通过 `PostMessageW(WM_CHAR)` 向中望CAD 的 MDIClient 子窗口发送 `(c:zwmcp-dispatch)` 触发指令，你可以继续在其他窗口工作，自动化在后台执行。
-- **JSON 文件桥接**：Python 端写入命令 JSON → LISP 调度器读取执行 → 写回结果 JSON，全程原子写入 + 请求 ID 校验。
-- **`execute_lisp`**：执行任意 AutoLISP 代码（中望CAD 完整支持 AutoLISP / Visual LISP，含 `vl-*`、`vlax-*` 函数）。
-- **内置 PNG 截图**：`view(operation="get_screenshot")` 抓取当前中望CAD 视图，即使窗口最小化/被遮挡也能截取。
-- **无头跨平台**：ezdxf 后端无需安装 CAD，可在 Linux/macOS/CI 中离线生成与编辑 DXF。
+| Problem in the original | In this fork |
+| --- | --- |
+| Accented text read from the drawing broke the reply (timeout) | Accents and symbols (ç, ã, é, ≥, Ø) round-trip correctly on any Windows code page |
+| `execute_lisp` code was written as GBK: accents corrupted outside China | Code is written as pure ASCII; characters are restored inside ZWCAD |
+| `create_leader` used the LEADER command, which leaves ZWCAD 2026 waiting at a prompt | Leader created via ActiveX; returns the leader and text handles |
+| With several drawings open, commands went to the first window found | They go to the active drawing; `set_target` pins one drawing and the LISP side refuses to run in any other |
+| Keystroke trigger: Dynamic Input box near the cursor, and ZWCAD jumping to the front | Trigger through ZWCAD's COM API, no keystrokes; focus stays where you are |
+| Reopening ZWCAD required restarting the server | The server finds the new window by itself |
+| Empty string `""` parameters were not parsed | Fixed |
 
-## 架构
+## Requirements
 
-```
-MCP 客户端 (Claude / Cursor / ...)
-    │  stdio (JSON-RPC)
-    ▼
-Python MCP Server (zwcad_mcp)
-    │
-    ├── File IPC 后端 ──► C:/zwcad-temp/zwcad_mcp_cmd_{id}.json
-    │       │                      │
-    │       │ PostMessageW(WM_CHAR) 触发 (c:zwmcp-dispatch)（不抢焦点）
-    │       ▼                      ▼
-    │   中望CAD (ZWCAD) ◄── zwcad_mcp_dispatch.lsp 读命令、执行、写结果
-    │                       C:/zwcad-temp/zwcad_mcp_result_{id}.json
-    │
-    └── ezdxf 后端 ──► 内存中的 DXF 文档（无头，无需 CAD）
-```
+- Windows 10/11.
+- ZWCAD 2020 or newer, with AutoLISP (Professional or Standard). Tested on 2026.
+- Python 3.10 or newer, **Windows build** (not WSL).
+- Git (optional; you can download the ZIP).
 
-## 环境要求（File IPC 后端）
+## Installation
 
-- **Windows 10/11**
-- **中望CAD 2020 或更高版本**（专业版/标准版均可，需支持 AutoLISP；中望CAD 完整实现了 AutoLISP/Visual LISP 方言）
-- **Python 3.10+**（Windows 原生 Python，非 WSL Python）
+### 1. Check Python
 
-> ezdxf 无头后端可在任意平台运行，无需安装中望CAD。
-
-## 快速开始
-
-### 1. 安装
+In PowerShell:
 
 ```powershell
-git clone <本仓库地址>
+python --version
+```
+
+If it is not 3.10 or newer, install it from python.org and tick **"Add python.exe to PATH"**. Close and reopen PowerShell afterwards.
+
+### 2. Download and install the server
+
+Pick a folder for your MCP servers. The example uses `C:\mcp`:
+
+```powershell
+mkdir C:\mcp; cd C:\mcp
+git clone https://github.com/ArthurmendesC/ZWCAD-MCP-fortis.git ZWCAD-MCP
 cd ZWCAD-MCP
 python -m venv .venv
 .venv\Scripts\pip install -e .
 ```
 
-### 2. 在中望CAD 中加载 LISP 调度器
+The `ZWCAD-MCP` at the end of `git clone` sets the folder name used in the paths of this guide.
 
-打开中望CAD，使用 **APPLOAD** 命令加载 `lisp-code/zwcad_mcp_dispatch.lsp`：
+Without git: download the ZIP from GitHub (Code → Download ZIP), extract it to `C:\mcp\ZWCAD-MCP` (rename it to `ZWCAD-MCP`; the ZIP comes as `ZWCAD-MCP-fortis-main`), go into the folder and run only the last two lines.
 
-1. 在命令行输入 `APPLOAD`
-2. 浏览到 `<仓库路径>/lisp-code/zwcad_mcp_dispatch.lsp`
-3. 点击 **加载**
-4. 命令行应显示：`=== ZWCAD-MCP Dispatch v1.0 loaded ===` 和 `Ready for commands via (c:zwmcp-dispatch)`
+### 3. Load the LISP in ZWCAD
 
-> **提示**：在 APPLOAD 对话框中把该文件加入「启动组」，即可随每张图纸自动加载。也可将 `lisp-code/` 加入中望CAD 的受信任路径。
+1. Open ZWCAD with a drawing and type `APPLOAD`.
+2. Add `C:\mcp\ZWCAD-MCP\lisp-code\zwcad_mcp_dispatch.lsp`, select it and click **Load**.
+3. With the file still selected, click **Add to Startup Suite**. It then loads by itself in every drawing you open later.
+4. Click **OK**. While that dialog is open, ZWCAD does not accept commands.
+5. Check the command line: `=== ZWCAD-MCP Dispatch v1.0 + Fortis patch loaded ===`.
 
-### 3. 配置 MCP 客户端
+Each drawing has its own LISP namespace. A drawing that was already open before you set up the Startup Suite does not have the dispatcher. In it, paste this at the command line (forward slashes, `/`):
 
-在客户端配置（如 Claude Desktop 的 `claude_desktop_config.json`）中添加：
+```
+(load "C:/mcp/ZWCAD-MCP/lisp-code/zwcad_mcp_dispatch.lsp")
+```
+
+### 4. Configure the MCP client
+
+In Claude Desktop: Settings → Developer → **Edit Config**. `claude_desktop_config.json` looks like this; change the path if you used another folder:
 
 ```json
 {
   "mcpServers": {
     "zwcad-mcp": {
-      "command": "C:\\path\\to\\ZWCAD-MCP\\.venv\\Scripts\\python.exe",
+      "command": "C:\\mcp\\ZWCAD-MCP\\.venv\\Scripts\\python.exe",
       "args": ["-m", "zwcad_mcp"],
-      "env": { "ZWCAD_MCP_BACKEND": "auto" }
+      "env": {
+        "ZWCAD_MCP_BACKEND": "file_ipc",
+        "ZWCAD_MCP_IPC_TIMEOUT": "30"
+      }
     }
   }
 }
 ```
 
-- `ZWCAD_MCP_BACKEND` 可选：`auto`（默认，优先 File IPC，找不到中望CAD 窗口则回落 ezdxf）、`file_ipc`（强制要求中望CAD 运行）、`ezdxf`（纯无头）。
+If the file already has other servers or other keys, follow these rules (this is where mistakes usually happen):
 
-### 4. 验证
+- The file starts with `{` alone on the first line.
+- Every server goes **inside** the braces of `"mcpServers"`.
+- Servers are separated by commas; no comma after the last one.
+- If there are other keys after `"mcpServers"`, its closing `}` takes a comma.
+- Paths use double backslashes (`\\`).
 
-在 MCP 客户端调用：
+### 5. Restart the client
 
-```
-system(operation="status")
-```
+In Claude Desktop, quit from the tray icon next to the clock → **Quit**. Closing with the X does not reload the config. Open it again and check in Settings → Developer that **zwcad-mcp** shows as running.
 
-中望CAD 正在运行时应返回 `backend: "file_ipc"`，否则返回 `backend: "ezdxf"`（无头模式）。
+### 6. Test
 
-## 工具一览（8 个聚合工具）
+With ZWCAD open on a drawing, ask the assistant to run:
 
-### `drawing` — 图纸/文件管理
-`create`（清空重置）· `open` · `info` · `save` · `save_as_dxf` · `plot_pdf` · `purge` · `get_variables` · `undo` · `redo`
+1. `system status` → should return `backend: file_ipc`.
+2. `system list_windows` → lists the open drawings and which one is active.
+3. `system execute_lisp` with `(getvar "DWGNAME")` → name of the active drawing.
 
-### `entity` — 实体增删改查
-- **创建**：`create_line`、`create_circle`、`create_polyline`、`create_rectangle`、`create_arc`、`create_ellipse`、`create_mtext`、`create_hatch`
-- **查询**：`list`、`count`、`get`
-- **修改**：`copy`、`move`、`rotate`、`scale`、`mirror`、`offset`*、`array`、`fillet`*、`chamfer`*、`erase`
+## Tools
 
-> \* `offset` / `fillet` / `chamfer` 仅 File IPC 后端支持。
+Eight grouped tools, as in the original: `drawing`, `entity`, `layer`, `block`, `annotation`, `pid`, `view` and `system`. See the operation list in the [original README](README.zh-CN.md#工具一览8-个聚合工具).
 
-### `layer` — 图层管理
-`list` · `create` · `set_current` · `set_properties` · `freeze` · `thaw` · `lock` · `unlock`
+The most useful one is `system` → `execute_lisp`: it runs any AutoLISP/Visual LISP in the active drawing and returns the value of the last expression. Prefer ActiveX (`vla-*`) and `entmake` over `(command ...)`, because interactive commands may stay waiting at a prompt.
 
-### `block` — 图块操作
-`list` · `insert` · `insert_with_attributes` · `get_attributes` · `update_attribute` · `define`（仅 ezdxf）
+New operations in this fork:
 
-### `annotation` — 文字与标注
-`create_text` · `create_dimension_linear` · `create_dimension_aligned` · `create_dimension_angular` · `create_dimension_radius` · `create_leader`
+| Operation | What it does |
+| --- | --- |
+| `system` → `list_windows` | Lists open drawings, the active one and the current target |
+| `system` → `set_target` `{"drawing": "floor-plan-01.dwg"}` | Pins a drawing: the server activates its tab and the LISP side refuses to run in any other. `{"drawing": ""}` clears it |
 
-### `pid` — 工艺流程图（P&ID，可选）
-`setup_layers` · `insert_symbol` · `list_symbols` · `draw_process_line` · `connect_equipment` · `add_flow_arrow` · `add_equipment_tag` · `add_line_number` · `insert_valve` · `insert_instrument` · `insert_pump` · `insert_tank`
+## Environment variables
 
-> P&ID 符号插入依赖 CTO 符号库（`C:\PIDv4-CTO\`），未安装时其余功能不受影响。
+| Variable | Default | Use |
+| --- | --- | --- |
+| `ZWCAD_MCP_BACKEND` | `auto` | `file_ipc` (recommended: errors out if ZWCAD is closed), `auto` (silently falls back to an in-memory DXF) or `ezdxf` (no ZWCAD) |
+| `ZWCAD_MCP_IPC_TIMEOUT` | `10.0` | Seconds per command (1–300). Recommended: `30` |
+| `ZWCAD_MCP_TRIGGER` | `com` | `com`: trigger through the COM API, no keystrokes. `keys`: original keystroke trigger |
+| `ZWCAD_MCP_IPC_DIR` | `C:/zwcad-temp` | File exchange folder (set it as a system variable if you change it) |
+| `ZWCAD_MCP_ONLY_TEXT` | `false` | Disables screenshots |
 
-### `view` — 视图与截图
-| 操作 | 说明 |
-|------|------|
-| `zoom_extents` | 缩放显示全部实体 |
-| `zoom_window` | 窗口缩放到指定范围 |
-| `get_screenshot` | **抓取当前中望CAD 视图为 PNG**（Win32 `PrintWindow`，最小化/后台也可截取；ezdxf 后端用 matplotlib 渲染） |
+## Usage rules
 
-多数写操作工具支持 `include_screenshot: true` 参数，执行后自动附带一张 PNG 截图，方便 AI 校验绘图结果。
+- **You can work in other programs** while the assistant draws: nothing shows up on screen.
+- **Do not work inside ZWCAD itself** at the same time: a half-finished command of yours can mix with the assistant's.
+- **Several drawings open:** commands go to the active drawing. Use `set_target` for another one and clear the target when done.
+- **ZWCAD dialogs** (APPLOAD, properties, etc.) block commands: close them first.
+- **Save before tests** on real drawings.
 
-### `system` — 服务器管理
-`status` · `health` · `get_backend` · `runtime` · `init` · **`execute_lisp`**
+## Troubleshooting
 
-> **`execute_lisp`** 执行任意 AutoLISP 代码（File IPC 后端）：
-> ```
-> system(operation="execute_lisp", data={"code": "(command \"_.CIRCLE\" \"100,100\" 50)"})
-> ```
-> 代码通过临时 `.lsp` 文件加载执行，可使用中望CAD 支持的全部 AutoLISP / Visual LISP 能力（`entmake`、`entget`、`ssget`、`vl-*`、`vlax-*` 等），是扩展本服务器的万能入口。
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Claude Desktop won't start: "Unexpected non-whitespace character after JSON" | Broken JSON, usually the opening `{` is missing | Open `%APPDATA%\Claude\claude_desktop_config.json` in Notepad and fix it (rules in step 4) |
+| zwcad-mcp does not show in the list | Block outside `"mcpServers"` or a wrong comma | Rules in step 4 |
+| "zwcad_mcp_dispatch.lsp not loaded" | LISP not loaded in that drawing | `(load ...)` at the command line, or APPLOAD → Load |
+| Only "v1.0 loaded" shows, without "+ Fortis patch" | The original LISP file is in place | Make sure you cloned this fork and load it again |
+| Timeout | Open dialog, stuck command, or LISP not loaded in the target drawing | Close the dialog, press ESC in ZWCAD, check the LISP. Before retrying, check whether the command partly ran |
+| "Wrong drawing ... Nothing was executed" | The pinned target is not the drawing the command reached | `list_windows` to see drawings; `set_target` with `""` clears it |
+| `status` returns `ezdxf` | ZWCAD closed, no drawing open, or WSL Python | Open a drawing; use Windows Python |
 
-## 环境变量
-
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `ZWCAD_MCP_BACKEND` | `auto` | 后端选择：`auto` / `file_ipc` / `ezdxf` |
-| `ZWCAD_MCP_IPC_DIR` | `C:/zwcad-temp` | IPC 命令/结果 JSON 目录（LISP 端会读取同名系统环境变量自动保持一致） |
-| `ZWCAD_MCP_IPC_TIMEOUT` | `10.0` | IPC 命令超时秒数（1–300） |
-| `ZWCAD_MCP_LISP_DIR` | 自动探测 | LISP 调度器目录覆盖（默认先找包内 `zwcad_mcp/lisp-code`，再找仓库根 `lisp-code/`） |
-| `ZWCAD_MCP_ONLY_TEXT` | `false` | 禁用截图（仅文本反馈） |
-
-> 修改 IPC 目录时，推荐把 `ZWCAD_MCP_IPC_DIR` 设为**系统环境变量**（而不仅是 MCP 客户端的 env），这样中望CAD 进程内的 LISP 调度器也能读到同一值；否则需手改 `zwcad_mcp_dispatch.lsp` 中的 `*zwmcp-ipc-dir*`。
-
-## 中望CAD 适配说明
-
-相对 AutoCAD 版本的主要适配点：
-
-1. **窗口探测**：按标题匹配 `ZWCAD` / `中望CAD`（兼容中英文版本），优先选择已打开图纸的窗口。
-2. **命令派发**：在 ZWCAD 2026 上经实测，按键需注入到 **绘图视图子窗口** `AfxFrameOrView140u` 而非 MDIClient；Python 端会优先枚举 `AfxFrameOrView*` 类子窗口，回退到 MDIClient。通过 `PostMessageW(WM_CHAR)` 注入 `(c:zwmcp-dispatch)` + 回车，发送前注入 2×ESC 取消滞留命令。
-3. **LISP 方言**：中望CAD 完整支持 AutoLISP / Visual LISP（含 `vl-*`、`vlax-*` ActiveX 函数），调度器 `zwcad_mcp_dispatch.lsp` 无需降级即可运行；相比 AutoCAD LT 反而能力更全。
-4. **编码兼容**：结果文件读取按 UTF-8 → GBK → cp1252 回退；`execute_lisp` 临时代码文件优先按 GBK 写入（中望CAD 按系统 ANSI 代码页读 LISP 文件），中文字符串不乱码。调度器 LISP 文件本身为纯 ASCII，任何语言的 Windows 均可加载。
-5. **SECURELOAD 兼容**（ZWCAD 2026 实测）：新版中望CAD 禁止 LISP 里 `setvar "SECURELOAD"`，`execute_lisp` 已改用「读文件 + `read`/`eval`」方式执行，不受 SECURELOAD 限制。
-6. **TEXT 创建**（ZWCAD 2026 实测）：`_TEXT` 命令提示序列与 AutoCAD 不同，`create_text` 改用 `entmake` 非交互创建，跨版本稳定。
-7. **打印样式**：`plot_pdf` 默认使用 `acad.ctb`（中望CAD 自带兼容样式表），可按需在 LISP 中改为 `zwcad.ctb` 等。
-
-## 新电脑部署清单
-
-1. 安装 **Windows 版 Python 3.10+**（勿用 WSL 内的 Python）。
-2. `git clone` 本仓库 → `python -m venv .venv` → `.venv\Scripts\pip install -e .`（会按平台自动装 pywin32）。
-3. 打开中望CAD（2020+，专业版/标准版），`APPLOAD` 加载 `lisp-code/zwcad_mcp_dispatch.lsp`，看到 `=== ZWCAD-MCP Dispatch v1.0 loaded ===` 即成功（建议加入「启动组」）。
-4. IPC 目录 `C:/zwcad-temp` 会由两端自动创建，无需手建；如需更换，设系统环境变量 `ZWCAD_MCP_IPC_DIR`。
-5. 把 `mcp-config.json` 内容拷入 MCP 客户端配置，将 `command` 改为本机 `.venv\Scripts\python.exe` 的**绝对路径**。
-6. 客户端里调用 `system(operation="status")` 验证，应返回 `backend: "file_ipc"`。
-
-常见问题：
-- **status 返回 ezdxf**：中望CAD 没开、没开图纸，或 MCP 用的是非 Windows Python。
-- **提示 dispatcher not loaded**：LISP 未加载或加载后新开了图纸标签页（每个文档命名空间独立，建议加入启动组）。
-- **命令超时**：确认中望CAD 命令行没有停在某个交互提示上（按 ESC 后重试）；Python 端每 2 秒会自动重发触发指令。
-
-## 开发与测试
+## Development
 
 ```powershell
 .venv\Scripts\pip install -e . pytest pytest-asyncio
 .venv\Scripts\python -m pytest tests/ -v
 ```
 
-## 目录结构
+## License and credits
 
-```
-ZWCAD-MCP/
-├── lisp-code/
-│   ├── zwcad_mcp_dispatch.lsp   # LISP 调度器（APPLOAD 加载到中望CAD）
-│   └── attribute_tools.lsp      # 块属性辅助函数
-├── src/zwcad_mcp/
-│   ├── server.py                # FastMCP 服务器，8 个聚合工具
-│   ├── client.py                # 后端单例、错误处理、截图辅助
-│   ├── config.py                # 后端探测与环境变量
-│   ├── screenshot.py            # Win32 PrintWindow / matplotlib 截图
-│   ├── backends/
-│   │   ├── base.py              # 后端抽象基类
-│   │   ├── file_ipc.py          # AutoLISP + Win32 PostMessage 后端
-│   │   └── ezdxf_backend.py     # ezdxf 无头后端
-│   └── pid/                     # P&ID 符号库支持（可选）
-├── tests/                       # pytest 测试
-├── mcp-config.json              # MCP 客户端配置示例
-└── pyproject.toml
-```
+MIT. See [LICENSE](LICENSE). The original copyright notice is kept.
 
-## 致谢
-
-- [puran-water/autocad-mcp](https://github.com/puran-water/autocad-mcp)（MIT）— 本项目的架构基线
-- [mysteryboy2000/ZWCAD-Mechanical-MCP](https://github.com/mysteryboy2000/ZWCAD-Mechanical-MCP) — 中望CAD MCP 工具设计参考
-
-## License
-
-dalingo
+- [puran-water/autocad-mcp](https://github.com/puran-water/autocad-mcp): base architecture (MIT).
+- [dalingo81/ZWCAD-MCP](https://github.com/dalingo81/ZWCAD-MCP): ZWCAD adaptation.
+- Fortis patch: Unicode compatibility, ActiveX leader, window targeting and keystroke-free trigger.

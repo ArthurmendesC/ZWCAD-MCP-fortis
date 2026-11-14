@@ -474,6 +474,11 @@ async def system(
       runtime       — Return process/runtime details for spawn diagnostics.
       init          — Re-initialize the backend.
       execute_lisp  — Execute arbitrary AutoLISP code (File IPC only). data: {code}
+      set_target    — Pin commands to one open drawing (File IPC only). data: {drawing}
+                      e.g. {"drawing": "floor-plan-01.dwg"}; {"drawing": ""} clears it.
+                      Commands then go to that drawing's window, and the LISP side
+                      refuses to run in any other drawing.
+      list_windows  — List open drawing windows, the active one and the target.
     """
     data = data or {}
 
@@ -515,6 +520,15 @@ async def system(
             return _json({"error": "data.code is required"})
         result = await backend.execute_lisp(data["code"])
         return await add_screenshot_if_available(result, include_screenshot)
+    elif operation in ("set_target", "list_windows"):
+        backend = await get_backend()
+        if not hasattr(backend, "set_target"):
+            return _json({"error": f"{operation} requires the file_ipc backend"})
+        if operation == "set_target":
+            result = await backend.set_target(data.get("drawing"))
+        else:
+            result = await backend.list_windows()
+        return _json(result.to_dict())
     else:
         return _json({"error": f"Unknown system operation: {operation}"})
 
@@ -546,5 +560,5 @@ def main():
         ],
     )
 
-    log.info("zwcad_mcp_starting", version="1.0.0")
+    log.info("zwcad_mcp_starting", version="1.1.0")
     mcp.run(transport="stdio")
