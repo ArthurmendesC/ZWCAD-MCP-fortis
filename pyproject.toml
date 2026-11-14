@@ -1,7 +1,7 @@
 [project]
 name = "zwcad-mcp"
-version = "1.0.0"
-description = "MCP server for ZWCAD automation and headless DXF generation"
+version = "1.1.0"
+description = "MCP server for ZWCAD automation (Unicode-safe, focus-free fork) and headless DXF generation"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"

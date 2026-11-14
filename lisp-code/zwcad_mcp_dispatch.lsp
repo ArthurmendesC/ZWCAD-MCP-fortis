@@ -39,14 +39,16 @@
     (progn
       (write-line "{" fp)
       (write-line (strcat "  \"request_id\": \"" request-id "\",") fp)
+      ;; [Fortis] Non-ASCII chars go out as \uXXXX so the file is pure ASCII
+      ;; (ZWCAD writes in the ANSI codepage; accents broke the JSON on PT-BR Windows).
       (if ok-flag
         (progn
           (write-line "  \"ok\": true," fp)
-          (write-line (strcat "  \"payload\": " payload) fp)
+          (write-line (strcat "  \"payload\": " (mcp-ascii-json payload)) fp)
         )
         (progn
           (write-line "  \"ok\": false," fp)
-          (write-line (strcat "  \"error\": \"" (mcp-escape-string error-msg) "\"") fp)
+          (write-line (strcat "  \"error\": \"" (mcp-ascii-json (mcp-escape-string error-msg)) "\"") fp)
         )
       )
       (write-line "}" fp)
@@ -72,6 +74,108 @@
     (setq i (1+ i))
   )
   result
+)
+
+;; -----------------------------------------------------------------------
+;; [Fortis] Unicode helpers
+;; -----------------------------------------------------------------------
+
+(defun mcp-hex4 (n / s d)
+  "Integer -> 4-digit lowercase hex string."
+  (setq s "")
+  (repeat 4
+    (setq d (rem n 16))
+    (setq s (strcat (substr "0123456789abcdef" (1+ d) 1) s))
+    (setq n (/ n 16))
+  )
+  s
+)
+
+(defun mcp-parse-hex (h / n i d)
+  "Hex string -> integer (nil if invalid)."
+  (setq n 0 i 1)
+  (while (and n (<= i (strlen h)))
+    (setq d (vl-string-search (strcase (substr h i 1)) "0123456789ABCDEF"))
+    (if d (setq n (+ (* n 16) d)) (setq n nil))
+    (setq i (1+ i))
+  )
+  n
+)
+
+(defun mcp-ascii-json (s / codes out)
+  "Escape non-ASCII and control chars as \\uXXXX. JSON-safe because these
+   chars only ever occur inside JSON string values."
+  (if (null s) (setq s ""))
+  (setq codes (vl-string->list s))
+  (if (vl-every '(lambda (c) (and (> c 31) (< c 128))) codes)
+    s
+    (progn
+      (setq out nil)
+      (foreach c codes
+        (if (or (< c 32) (> c 127))
+          (foreach k (vl-string->list (strcat "\\u" (mcp-hex4 (if (> c 65535) 63 c))))
+            (setq out (cons k out)))
+          (setq out (cons c out))
+        )
+      )
+      (vl-list->string (reverse out))
+    )
+  )
+)
+
+(defun mcp-json-unescape (s / codes out c n code)
+  "Decode JSON escapes (\\uXXXX, \\n, \\t, \\\", \\\\ ...) in a raw JSON string value."
+  (if (or (null s) (not (vl-string-search "\\" s)))
+    s
+    (progn
+      (setq codes (vl-string->list s) out nil)
+      (while codes
+        (setq c (car codes) codes (cdr codes))
+        (if (and (= c 92) codes)
+          (progn
+            (setq n (car codes) codes (cdr codes))
+            (cond
+              ((and (= n 117) (>= (length codes) 4))
+               (setq code (mcp-parse-hex (vl-list->string
+                            (list (nth 0 codes) (nth 1 codes) (nth 2 codes) (nth 3 codes)))))
+               (setq out (cons (if code code 63) out))
+               (setq codes (cddddr codes)))
+              ((= n 110) (setq out (cons 10 out)))
+              ((= n 116) (setq out (cons 9 out)))
+              ((= n 114) (setq out (cons 13 out)))
+              ((= n 98)  (setq out (cons 8 out)))
+              ((= n 102) (setq out (cons 12 out)))
+              (t (setq out (cons n out)))
+            )
+          )
+          (setq out (cons c out))
+        )
+      )
+      (vl-list->string (reverse out))
+    )
+  )
+)
+
+(defun mcp-decode-markers (text / start p q code)
+  "Replace {{U+XXXX}} markers (written by Python for non-ASCII chars in
+   execute_lisp code) with the real character."
+  (setq start 0)
+  (while (setq p (vl-string-search "{{U+" text start))
+    (setq q (vl-string-search "}}" text (+ p 4)))
+    (if (and q (setq code (mcp-parse-hex (substr text (+ p 5) (- q p 4)))))
+      (progn
+        (setq text (strcat (substr text 1 p) (chr code) (substr text (+ q 3))))
+        (setq start (1+ p))
+      )
+      (setq start (+ p 4))
+    )
+  )
+  text
+)
+
+(defun mcp-dwg-base (name)
+  "Upper-case drawing name without path or extension."
+  (strcase (vl-filename-base name))
 )
 
 (defun mcp-read-file-lines (filepath / fp line lines)
@@ -110,16 +214,17 @@
               (setq pos (+ pos 2))  ; 0-based search result + 2 = 1-based position after quote
               ;; Find closing quote (skip escaped quotes)
               (setq end-pos pos)
+              ;; [Fortis] no forced first char: empty strings "" now parse correctly
               (while (and (<= end-pos (strlen json))
-                          (or (= end-pos pos)
-                              (/= (substr json end-pos 1) "\"")))
+                          (/= (substr json end-pos 1) "\""))
                 ;; Handle escaped characters
                 (if (= (substr json end-pos 1) "\\")
                   (setq end-pos (+ end-pos 2))
                   (setq end-pos (1+ end-pos))
                 )
               )
-              (substr json pos (- end-pos pos))
+              ;; [Fortis] decode \uXXXX etc. (Python sends accents as \u escapes)
+              (mcp-json-unescape (substr json pos (- end-pos pos)))
             )
           )
         )
@@ -648,6 +753,8 @@
     (setq text (strcat text line "\n"))
   )
   (close fp)
+  ;; [Fortis] file is pure ASCII; restore non-ASCII chars from {{U+XXXX}} markers
+  (setq text (mcp-decode-markers text))
   (eval (read (strcat "(progn " text "\n)")))
 )
 
@@ -1169,20 +1276,37 @@
   (cons T "{\"entity_type\":\"DIMENSION\"}")
 )
 
-(defun mcp-cmd-create-leader (params / text pts-str pairs pt-str)
+(defun mcp-cmd-create-leader (params / text pts-str pts ms h mt arr ld p-last p-prev)
+  ;; [Fortis] ActiveX instead of (command "_.LEADER" ...): ZWCAD 2026's LEADER
+  ;; prompt sequence differs and left the command waiting (result timed out).
+  (vl-load-com)
   (setq text (mcp-json-get-string params "text"))
   (setq pts-str (mcp-json-get-string params "points_str"))
   (if (not pts-str)
     (cons nil "points_str required (format: x1,y1;x2,y2;...)")
     (progn
-      (command "_.LEADER")
-      (setq pairs (mcp-split-string pts-str ";"))
-      (foreach pt-str pairs
-        (command (list (atof (car (mcp-split-string pt-str ",")))
-                       (atof (cadr (mcp-split-string pt-str ","))) 0))
+      (setq pts (mapcar
+                  '(lambda (s) (list (atof (car (mcp-split-string s ",")))
+                                     (atof (cadr (mcp-split-string s ","))) 0.0))
+                  (mcp-split-string pts-str ";")))
+      (if (< (length pts) 2)
+        (cons nil "leader needs at least 2 points")
+        (progn
+          (setq ms (vla-get-ModelSpace (vla-get-ActiveDocument (vlax-get-acad-object))))
+          (setq h (* (getvar "DIMTXT") (if (> (getvar "DIMSCALE") 0) (getvar "DIMSCALE") 1.0)))
+          (setq p-last (last pts) p-prev (nth (- (length pts) 2) pts))
+          (setq mt (vla-AddMText ms (vlax-3d-point p-last) 0.0 (if text text "")))
+          (vla-put-Height mt h)
+          ;; text to the right of the leader end if the last segment goes right, else left
+          (vla-put-AttachmentPoint mt (if (>= (car p-last) (car p-prev)) 4 6))
+          (vla-put-InsertionPoint mt (vlax-3d-point p-last))
+          (setq arr (vlax-make-safearray vlax-vbDouble (cons 0 (1- (* 3 (length pts))))))
+          (vlax-safearray-fill arr (apply 'append pts))
+          (setq ld (vla-AddLeader ms arr mt 2))  ; 2 = acLineWithArrow
+          (cons T (strcat "{\"entity_type\":\"LEADER\",\"handle\":\"" (vla-get-Handle ld)
+                          "\",\"text_handle\":\"" (vla-get-Handle mt) "\"}"))
+        )
       )
-      (command "" text "")
-      (cons T "{\"entity_type\":\"LEADER\"}")
     )
   )
 )
@@ -1301,7 +1425,7 @@
 ;; Main dispatcher -- called by "(c:zwmcp-dispatch)" from Python
 ;; -----------------------------------------------------------------------
 
-(defun c:zwmcp-dispatch ( / cmd-files cmd-file json-text request-id cmd-name params-str result result-file)
+(defun c:zwmcp-dispatch ( / cmd-files cmd-file json-text request-id cmd-name params-str result result-file expect-dwg)
   "Find pending command file, dispatch, write result."
   ;; Find first pending command file
   (setq cmd-files (vl-directory-files *zwmcp-ipc-dir* "zwcad_mcp_cmd_*.json" 1))
@@ -1324,11 +1448,19 @@
             (progn
               (princ (strcat "\nMCP: Dispatching " cmd-name " [" request-id "]"))
 
-              ;; Execute via whitelist dispatcher
-              (setq result
-                (vl-catch-all-apply
-                  'zwmcp-dispatch-command
-                  (list cmd-name json-text)
+              ;; [Fortis] Guard: refuse to run in a drawing other than the target
+              (setq expect-dwg (mcp-json-get-string json-text "expect_dwg"))
+              (if (and expect-dwg (> (strlen expect-dwg) 0)
+                       (/= (mcp-dwg-base expect-dwg) (mcp-dwg-base (getvar "DWGNAME"))))
+                (setq result (cons nil (strcat "Wrong drawing: command reached "
+                                               (getvar "DWGNAME") " but target is " expect-dwg
+                                               ". Nothing was executed.")))
+                ;; Execute via whitelist dispatcher
+                (setq result
+                  (vl-catch-all-apply
+                    'zwmcp-dispatch-command
+                    (list cmd-name json-text)
+                  )
                 )
               )
 
@@ -1403,7 +1535,7 @@
 ;; Startup message
 ;; -----------------------------------------------------------------------
 
-(princ "\n=== ZWCAD-MCP Dispatch v1.0 loaded ===")
+(princ "\n=== ZWCAD-MCP Dispatch v1.0 + Fortis patch loaded ===")
 (princ "\nIPC directory: ")
 (princ *zwmcp-ipc-dir*)
 (princ "\nReady for commands via (c:zwmcp-dispatch)")

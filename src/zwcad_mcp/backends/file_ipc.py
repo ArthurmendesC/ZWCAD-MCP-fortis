@@ -29,6 +29,14 @@ log = structlog.get_logger()
 POLL_INTERVAL = 0.1  # seconds
 TIMEOUT = IPC_TIMEOUT  # seconds (configurable via ZWCAD_MCP_IPC_TIMEOUT)
 STALE_THRESHOLD = 60.0  # clean up files older than this
+# [Fortis] "com" (default): trigger via COM SendCommand, keys as fallback.
+#          "keys": original keystroke injection only.
+TRIGGER_MODE = os.environ.get("ZWCAD_MCP_TRIGGER", "com").strip().lower()
+
+
+def encode_lisp_markers(code: str) -> str:
+    """[Fortis] Replace non-ASCII chars with {{U+XXXX}} markers (decoded in LISP)."""
+    return "".join(c if ord(c) < 128 else "{{U+%04X}}" % ord(c) for c in code)
 
 
 def find_zwcad_window() -> int | None:
@@ -78,6 +86,10 @@ class FileIPCBackend(ZWCADBackend):
         self._ipc_dir = Path(IPC_DIR)
         self._screenshot_provider = None
         self._lock = asyncio.Lock()  # Single in-flight command
+        # [Fortis] Optional target drawing (name, with or without .dwg).
+        # When set, commands go to that drawing's window and the LISP side
+        # refuses to run them in any other drawing.
+        self._target_dwg: str | None = None
 
     @property
     def name(self) -> str:
@@ -159,6 +171,8 @@ class FileIPCBackend(ZWCADBackend):
         cmd_file = self._ipc_dir / f"zwcad_mcp_cmd_{request_id}.json"
         result_file = self._ipc_dir / f"zwcad_mcp_result_{request_id}.json"
         tmp_file = cmd_file.with_suffix(".tmp")
+        # [Fortis] remember which window the user is in, to give focus back
+        prev_fg = self._foreground_window()
 
         try:
             # Strip None values — the simple LISP JSON parser can't handle null
@@ -170,13 +184,17 @@ class FileIPCBackend(ZWCADBackend):
                 "params": clean_params,
                 "ts": time.time(),
             }
+            if self._target_dwg:
+                payload["expect_dwg"] = self._target_dwg
             tmp_file.write_text(json.dumps(payload), encoding="utf-8")
             tmp_file.rename(cmd_file)
 
-            # Type the fixed dispatch trigger
-            self._type_dispatch_trigger()
+            # [Fortis] Trigger: COM SendCommand first (no keystrokes, no dynamic
+            # input box); keystrokes only as fallback / on retries.
+            attempt = 0
+            self._trigger(attempt, prev_fg)
 
-            # Poll for result. If ZWCAD misses the keystroke injection
+            # Poll for result. If ZWCAD misses the trigger
             # (busy regen / focus change), re-send the trigger every 2s
             # while the command file still exists.
             deadline = time.time() + TIMEOUT
@@ -187,7 +205,8 @@ class FileIPCBackend(ZWCADBackend):
                     and cmd_file.exists()
                     and not result_file.exists()
                 ):
-                    self._type_dispatch_trigger()
+                    attempt += 1
+                    self._trigger(attempt, prev_fg)
                     next_retrigger = time.time() + 2.0
                 if result_file.exists():
                     try:
@@ -218,6 +237,8 @@ class FileIPCBackend(ZWCADBackend):
             return CommandResult(ok=False, error=f"Timeout waiting for result (request_id={request_id})")
 
         finally:
+            # [Fortis] give focus back if ZWCAD took it while the user was elsewhere
+            self._restore_foreground(prev_fg)
             # Cleanup
             for f in (cmd_file, result_file, tmp_file):
                 try:
@@ -269,7 +290,9 @@ class FileIPCBackend(ZWCADBackend):
             WM_KEYDOWN = 0x0100
             WM_KEYUP = 0x0101
             VK_ESCAPE = 0x1B
-            target = self._command_hwnd or self._hwnd
+            # [Fortis] resolve the view of the target (or active) drawing on every
+            # send; falls back to the original first-view behaviour.
+            target = self._resolve_view_hwnd() or self._command_hwnd or self._hwnd
             post = ctypes.windll.user32.PostMessageW
 
             # Cancel any pending command (2x ESC for nested commands)
@@ -285,6 +308,233 @@ class FileIPCBackend(ZWCADBackend):
             time.sleep(0.05)
         except Exception as e:
             log.error("dispatch_trigger_failed", error=str(e))
+
+    # --- [Fortis] Trigger without keystrokes + focus guard ----------------
+
+    def _trigger(self, attempt: int, prev_fg: int | None) -> None:
+        """attempt 0 tries COM; retries (ZWCAD may be stuck in a prompt that needs
+        the ESC the keystroke path sends) or COM failure use keystrokes."""
+        used = None
+        if TRIGGER_MODE == "com" and attempt == 0:
+            # Activate the target drawing (if any) before talking COM, since
+            # SendCommand goes to the active document.
+            if self._target_dwg:
+                self._resolve_view_hwnd()
+            if self._com_send_dispatch():
+                used = "com"
+        if used is None:
+            self._type_dispatch_trigger()
+            used = "keys"
+        log.info("dispatch_trigger", method=used, attempt=attempt)
+        self._restore_foreground(prev_fg)
+
+    def _com_send_dispatch(self) -> bool:
+        """Send (c:zwmcp-dispatch) through ZWCAD's COM API in a worker thread
+        (bounded wait, so a busy ZWCAD can't hang the server)."""
+        if sys.platform != "win32":
+            return False
+        import threading
+
+        ok = {"v": False}
+
+        def worker():
+            try:
+                import pythoncom
+                import win32com.client
+
+                pythoncom.CoInitialize()
+                try:
+                    app = win32com.client.GetActiveObject("ZWCAD.Application")
+                    app.ActiveDocument.SendCommand("(c:zwmcp-dispatch)\n")
+                    ok["v"] = True
+                finally:
+                    pythoncom.CoUninitialize()
+            except Exception as e:
+                log.info("com_trigger_failed", error=str(e))
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        t.join(3.0)
+        return ok["v"]
+
+    @staticmethod
+    def _foreground_window() -> int | None:
+        if sys.platform != "win32":
+            return None
+        try:
+            import ctypes
+
+            return ctypes.windll.user32.GetForegroundWindow() or None
+        except Exception:
+            return None
+
+    def _restore_foreground(self, prev: int | None) -> None:
+        """If ZWCAD became the foreground window while the user was in another
+        app, put that app back in front. Never touches anything if the user
+        was already in ZWCAD."""
+        if sys.platform != "win32" or not prev or not self._hwnd:
+            return
+        try:
+            import ctypes
+
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+            GA_ROOT = 2
+            if user32.GetAncestor(prev, GA_ROOT) == self._hwnd:
+                return  # user was working in ZWCAD itself
+            cur = user32.GetForegroundWindow()
+            if not cur or cur == prev or user32.GetAncestor(cur, GA_ROOT) != self._hwnd:
+                return  # ZWCAD did not steal focus
+            if not user32.IsWindow(prev):
+                return
+            fg_thread = user32.GetWindowThreadProcessId(cur, None)
+            my_thread = kernel32.GetCurrentThreadId()
+            attached = user32.AttachThreadInput(my_thread, fg_thread, True)
+            try:
+                user32.SetForegroundWindow(prev)
+            finally:
+                if attached:
+                    user32.AttachThreadInput(my_thread, fg_thread, False)
+            log.info("focus_restored", hwnd=prev)
+        except Exception as e:
+            log.info("focus_restore_failed", error=str(e))
+
+    # --- [Fortis] Drawing-window targeting -------------------------------
+
+    WM_MDIACTIVATE = 0x0222
+    WM_MDIGETACTIVE = 0x0229
+
+    def _ensure_main_hwnd(self) -> int | None:
+        """Re-find the ZWCAD main window if the cached handle is gone."""
+        try:
+            import win32gui
+
+            if self._hwnd and win32gui.IsWindow(self._hwnd):
+                return self._hwnd
+            self._hwnd = find_zwcad_window()
+            if self._hwnd:
+                from zwcad_mcp.screenshot import Win32ScreenshotProvider
+
+                self._screenshot_provider = Win32ScreenshotProvider(self._hwnd)
+                self._command_hwnd = self._find_command_line_hwnd()
+            return self._hwnd
+        except Exception:
+            return self._hwnd
+
+    def _mdi_client(self) -> int | None:
+        try:
+            import win32gui
+
+            found: list[int] = []
+
+            def cb(h, _):
+                if win32gui.GetClassName(h) == "MDIClient":
+                    found.append(h)
+                return True
+
+            win32gui.EnumChildWindows(self._hwnd, cb, None)
+            return found[0] if found else None
+        except Exception:
+            return None
+
+    def _mdi_children(self, mdi: int) -> list[tuple[int, str]]:
+        """Direct MDI child windows (one per open drawing) with their titles."""
+        try:
+            import win32gui
+
+            kids: list[tuple[int, str]] = []
+
+            def cb(h, _):
+                if win32gui.GetParent(h) == mdi:
+                    kids.append((h, win32gui.GetWindowText(h)))
+                return True
+
+            win32gui.EnumChildWindows(mdi, cb, None)
+            return kids
+        except Exception:
+            return []
+
+    @staticmethod
+    def _view_in(parent: int) -> int | None:
+        try:
+            import win32gui
+
+            views: list[int] = []
+
+            def cb(h, _):
+                if win32gui.GetClassName(h).startswith("AfxFrameOrView"):
+                    views.append(h)
+                return True
+
+            win32gui.EnumChildWindows(parent, cb, None)
+            return views[0] if views else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _dwg_base(name: str) -> str:
+        base = name.replace("\\", "/").rsplit("/", 1)[-1].strip().rstrip("*").strip()
+        if base.lower().endswith(".dwg"):
+            base = base[:-4]
+        return base.lower()
+
+    def _resolve_view_hwnd(self) -> int | None:
+        """View window of the target drawing (activating it if needed), or of
+        the active drawing when no target is set. None -> caller falls back."""
+        if sys.platform != "win32" or not self._ensure_main_hwnd():
+            return None
+        try:
+            import win32gui
+
+            mdi = self._mdi_client()
+            if not mdi:
+                return None
+            active = win32gui.SendMessage(mdi, self.WM_MDIGETACTIVE, 0, 0)
+            chosen = active or None
+            if self._target_dwg:
+                want = self._dwg_base(self._target_dwg)
+                for h, title in self._mdi_children(mdi):
+                    if want and want in title.lower():
+                        if h != active:
+                            win32gui.SendMessage(mdi, self.WM_MDIACTIVATE, h, 0)
+                            time.sleep(0.3)
+                        chosen = h
+                        break
+            if not chosen:
+                return None
+            return self._view_in(chosen) or chosen
+        except Exception as e:
+            log.error("resolve_view_failed", error=str(e))
+            return None
+
+    async def set_target(self, drawing: str | None) -> CommandResult:
+        """Set (or clear, with None/"") the drawing that commands must run in."""
+        self._target_dwg = drawing.strip() if drawing and drawing.strip() else None
+        return await self.list_windows()
+
+    async def list_windows(self) -> CommandResult:
+        """Diagnostic: open drawing windows, active one, current target."""
+        info: dict = {"target": self._target_dwg, "main_hwnd": None, "drawings": []}
+        if sys.platform == "win32" and self._ensure_main_hwnd():
+            try:
+                import win32gui
+
+                info["main_hwnd"] = self._hwnd
+                info["main_title"] = win32gui.GetWindowText(self._hwnd)
+                mdi = self._mdi_client()
+                info["mdi_client"] = mdi
+                if mdi:
+                    active = win32gui.SendMessage(mdi, self.WM_MDIGETACTIVE, 0, 0)
+                    for h, title in self._mdi_children(mdi):
+                        info["drawings"].append({
+                            "hwnd": h,
+                            "title": title,
+                            "active": h == active,
+                            "view": self._view_in(h),
+                        })
+            except Exception as e:
+                info["error"] = str(e)
+        return CommandResult(ok=True, payload=info)
 
     def _cleanup_stale_files(self):
         """Remove stale IPC files from previous sessions."""
@@ -346,13 +596,11 @@ class FileIPCBackend(ZWCADBackend):
         """
         request_id = uuid.uuid4().hex[:12]
         code_file = self._ipc_dir / f"zwcad_mcp_lisp_{request_id}.lsp"
-        # ZWCAD's (load ...) reads LISP files in the system ANSI codepage.
-        # On Chinese Windows that is GBK — write GBK when possible so that
-        # Chinese strings inside LISP code survive the round trip.
-        try:
-            code_file.write_text(code, encoding="gbk")
-        except UnicodeEncodeError:
-            code_file.write_text(code, encoding="utf-8")
+        # [Fortis] Write pure ASCII: every non-ASCII char becomes a {{U+XXXX}}
+        # marker that the LISP side turns back into the real char with (chr).
+        # Works on any Windows codepage (the original GBK write broke accents
+        # on Portuguese Windows).
+        code_file.write_text(encode_lisp_markers(code), encoding="ascii")
         return await self._dispatch("execute-lisp", {
             "code_file": str(code_file).replace("\\", "/")
         })
